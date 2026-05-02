@@ -1,0 +1,5 @@
+Model,Accuracy (%),Precision,Recall,F1-Score,Training Time
+Logistic Regression,66.76,0.6675,0.6676,0.6668,15.94s
+Decision Tree,65.99,0.6614,0.6599,0.6599,44.83s
+Random Forest,69.43,0.6964,0.6943,0.6945,18.88s
+SVM (RBF),68.92,0.69,0.6892,0.6889,513.29s

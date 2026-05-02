@@ -1,0 +1,23 @@
+# Environments
+venv311/
+env/
+venv/
+.env
+
+# Python Cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Large Model Files (GitHub limits files to 100MB)
+*.pth
+*.pt
+*.h5
+*.keras
+
+# Data
+data/
+
+# IDEs
+.vscode/
+.idea/
