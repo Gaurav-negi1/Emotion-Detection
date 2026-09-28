@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Emotion Detection — Web</title>
+    <script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.js"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #1a1a2e;
+            color: #eee;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            margin: 0;
+        }
+        h1 { color: #00d2ff; margin-bottom: 10px; }
+        .container {
+            display: flex;
+            gap: 20px;
+            background: #16213e;
+            padding: 20px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        }
+        .video-wrapper {
+            position: relative;
+            border-radius: 10px;
+            overflow: hidden;
+            border: 2px solid #0f3460;
+        }
+        video { display: block; width: 640px; height: 480px; object-fit: cover; }
+        #overlay {
+            position: absolute;
+            top: 0; left: 0;
+            width: 640px; height: 480px;
+            pointer-events: none;
+        }
+        canvas { display: none; }
+        .results {
+            width: 300px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .emotion-label {
+            font-size: 1.8em;
+            font-weight: bold;
+            text-align: center;
+            padding: 15px;
+            border-radius: 10px;
+            background: #0f3460;
+            transition: all 0.3s ease;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+        .bar-container { display: flex; flex-direction: column; gap: 6px; }
+        .bar-row { display: flex; align-items: center; gap: 10px; font-size: 0.85em; }
+        .bar-label { width: 70px; text-align: right; color: #aaa; }
+        .bar-bg {
+            flex-grow: 1; height: 18px; background: #0f3460;
+            border-radius: 9px; overflow: hidden;
+        }
+        .bar-fill {
+            height: 100%; width: 0%; border-radius: 9px;
+            transition: width 0.1s linear, background-color 0.3s ease;
+        }
+        .status {
+            text-align: center; font-size: 0.8em;
+            color: #888; margin-top: 10px;
+            font-family: 'Consolas', monospace;
+        }
+        button {
+            padding: 10px 20px; font-size: 1em; border: none;
+            border-radius: 8px; background: #00d2ff; color: #1a1a2e;
+            font-weight: bold; cursor: pointer; transition: background 0.3s;
+        }
+        button:hover { background: #00b0d4; }
+        button:disabled { background: #555; cursor: not-allowed; }
+    </style>
+</head>
+<body>
+
+    <h1>Emotion Detection</h1>
+    <p style="color:#aaa; margin-top:0;">EfficientNet • Face-Detected Web Inference</p>
+
+    <div class="container">
+        <div class="video-wrapper">
+            <video id="video" autoplay playsinline></video>
+            <canvas id="overlay"></canvas>
+            <canvas id="canvas"></canvas>
+        </div>
+
+        <div class="results">
+            <div id="emotion-label" class="emotion-label">Waiting...</div>
+            <div id="bars" class="bar-container"></div>
+            <div id="status" class="status">Loading face detector...</div>
+            <button id="toggleBtn" disabled>Start Camera</button>
+        </div>
+    </div>
+
+    <script>
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const overlay = document.getElementById('overlay');
+        const ctx = canvas.getContext('2d');
+        const overlayCtx = overlay.getContext('2d');
+        const emotionLabel = document.getElementById('emotion-label');
+        const barsContainer = document.getElementById('bars');
+        const statusDiv = document.getElementById('status');
+        const toggleBtn = document.getElementById('toggleBtn');
+
+        let isRunning = false;
+        let stream = null;
+        let animationFrameId = null;
+        let faceDetectorReady = false;
+        let inFlight = false;
+
+        // Time-based smoothing window (matches webcam_inference.py feel)
+        const SMOOTHING_WINDOW_MS = 400;
+        let smoothBuffer = [];   // entries: {t, probs}
+
+        // Metrics
+        let lastServerMs = 0;
+        let lastRoundTripMs = 0;
+        let lastSendTime = 0;
+
+        const EMOTION_COLORS = {
+            "angry":    "#dc3545",
+            "disgust":  "#8bc34a",
+            "fear":     "#9c27b0",
+            "happy":    "#ffc107",
+            "neutral":  "#b0bec5",
+            "sad":      "#ff7043",
+            "surprise": "#00e676"
+        };
+
+        const emotionKeys = ["angry", "disgust", "fear", "happy", "neutral", "sad", "surprise"];
+        const barElements = {};
+
+        emotionKeys.forEach(emotion => {
+            const row = document.createElement('div');
+            row.className = 'bar-row';
+            const label = document.createElement('div');
+            label.className = 'bar-label';
+            label.textContent = emotion.charAt(0).toUpperCase() + emotion.slice(1);
+            const bg = document.createElement('div');
+            bg.className = 'bar-bg';
+            const fill = document.createElement('div');
+            fill.className = 'bar-fill';
+            fill.style.backgroundColor = EMOTION_COLORS[emotion] || '#888';
+            bg.appendChild(fill);
+            row.appendChild(label);
+            row.appendChild(bg);
+            barsContainer.appendChild(row);
+            barElements[emotion] = fill;
+        });
+
+        // ─── Load face-api.js models ───
+        async function loadFaceDetector() {
+            const MODEL_URL = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/';
+            try {
+                await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
+                faceDetectorReady = true;
+                statusDiv.textContent = 'Face detector ready. Click Start Camera.';
+            } catch (err) {
+                console.error('Face detector load error:', err);
+                statusDiv.textContent = 'Face detector failed to load.';
+            }
+        }
+        loadFaceDetector();
+
+        // ─── Camera controls ───
+        async function startCamera() {
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({
+                    video: { width: 640, height: 480, facingMode: 'user' }
+                });
+                video.srcObject = stream;
+                await video.play();
+                isRunning = true;
+                toggleBtn.textContent = 'Stop Camera';
+                toggleBtn.disabled = false;
+                statusDiv.textContent = 'Camera active. Looking for face...';
+                smoothBuffer = [];
+                detectLoop();
+            } catch (err) {
+                console.error('Camera error:', err);
+                statusDiv.textContent = 'Error: Could not access camera.';
+                toggleBtn.disabled = false;
+                toggleBtn.textContent = 'Retry Camera';
+            }
+        }
+
+        function stopCamera() {
+            isRunning = false;
+            if (stream) {
+                stream.getTracks().forEach(t => t.stop());
+                stream = null;
+            }
+            if (animationFrameId) cancelAnimationFrame(animationFrameId);
+            video.srcObject = null;
+            toggleBtn.textContent = 'Start Camera';
+            statusDiv.textContent = 'Camera stopped.';
+            emotionLabel.textContent = 'Waiting...';
+            emotionLabel.style.backgroundColor = '#0f3460';
+            overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
+            emotionKeys.forEach(e => barElements[e].style.width = '0%');
+            smoothBuffer = [];
+        }
+
+        toggleBtn.addEventListener('click', () => {
+            if (isRunning) stopCamera();
+            else {
+                toggleBtn.disabled = true;
+                toggleBtn.textContent = 'Starting...';
+                startCamera();
+            }
+        });
+
+        // ─── Detection loop — fires as fast as server responds ───
+        function detectLoop() {
+            if (!isRunning) return;
+            // Fire as fast as possible; inFlight guard prevents queuing
+            captureAndSend();
+            animationFrameId = requestAnimationFrame(detectLoop);
+        }
+
+        // ─── Main capture: detect face, crop square, send to server ───
+        async function captureAndSend() {
+            if (inFlight) return;
+            if (video.readyState !== 4) return;
+
+            inFlight = true;
+            const t_start = performance.now();
+            lastSendTime = t_start;
+
+            try {
+                // Match canvas & overlay to video size
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                overlay.width = video.videoWidth;
+                overlay.height = video.videoHeight;
+
+                // Detect faces (TinyFaceDetector is fast)
+                let detections = [];
+                if (faceDetectorReady) {
+                    detections = await faceapi.detectAllFaces(
+                        video,
+                        new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.4 })
+                    );
+                }
+
+                overlayCtx.clearRect(0, 0, overlay.width, overlay.height);
+
+                if (detections.length === 0) {
+                    statusDiv.textContent = 'No face detected.';
+                    emotionLabel.textContent = 'No Face';
+                    emotionLabel.style.backgroundColor = '#333';
+                    return;
+                }
+
+                // Pick largest face
+                let best = detections[0];
+                for (const d of detections) {
+                    if (d.box.width * d.box.height > best.box.width * best.box.height) best = d;
+                }
+
+                const { x, y, width, height } = best.box;
+
+                // Make crop SQUARE (matches training transforms)
+                const size = Math.max(width, height);
+                const cx = x + width / 2;
+                const cy = y + height / 2;
+                const pad = Math.round(0.12 * size);
+
+                const x1 = Math.max(0, Math.floor(cx - size/2 - pad));
+                const y1 = Math.max(0, Math.floor(cy - size/2 - pad));
+                const x2 = Math.min(video.videoWidth,  Math.floor(cx + size/2 + pad));
+                const y2 = Math.min(video.videoHeight, Math.floor(cy + size/2 + pad));
+
+                // Draw green square overlay
+                overlayCtx.strokeStyle = '#00ff88';
+                overlayCtx.lineWidth = 3;
+                overlayCtx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+
+                // Crop onto hidden canvas
+                canvas.width = x2 - x1;
+                canvas.height = y2 - y1;
+                ctx.drawImage(video, x1, y1, x2 - x1, y2 - y1, 0, 0, x2 - x1, y2 - y1);
+
+                // Higher quality JPEG (0.92) — small size increase, big accuracy win
+                const imageData = canvas.toDataURL('image/jpeg', 0.92);
+
+                const response = await fetch('/predict', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ image: imageData })
+                });
+                if (!response.ok) throw new Error(`Server ${response.status}`);
+                const result = await response.json();
+                if (result.error) {
+                    statusDiv.textContent = 'Server error: ' + result.error;
+                    return;
+                }
+
+                lastServerMs = result.server_ms || 0;
+                lastRoundTripMs = performance.now() - t_start;
+                updateUI(result);
+
+            } catch (err) {
+                console.error('Prediction error:', err);
+                statusDiv.textContent = 'Connection error — is Flask running?';
+            } finally {
+                inFlight = false;
+            }
+        }
+
+        // ─── Update UI with time-based smoothing ───
+        function updateUI(result) {
+            const now = performance.now();
+            smoothBuffer.push({ t: now, probs: result.probabilities });
+            // Drop entries older than SMOOTHING_WINDOW_MS
+            smoothBuffer = smoothBuffer.filter(e => now - e.t < SMOOTHING_WINDOW_MS);
+
+            const avg = {};
+            emotionKeys.forEach(k => avg[k] = 0);
+            for (const e of smoothBuffer) {
+                for (const k of emotionKeys) avg[k] += e.probs[k] || 0;
+            }
+            for (const k of emotionKeys) avg[k] /= smoothBuffer.length;
+
+            let topEmotion = emotionKeys[0];
+            let topProb = 0;
+            for (const k of emotionKeys) {
+                if (avg[k] > topProb) { topProb = avg[k]; topEmotion = k; }
+            }
+
+            emotionLabel.textContent = `${topEmotion} ${(topProb * 100).toFixed(1)}%`;
+            emotionLabel.style.backgroundColor = EMOTION_COLORS[topEmotion] || '#0f3460';
+            emotionLabel.style.color = '#fff';
+
+            emotionKeys.forEach(k => {
+                barElements[k].style.width = `${(avg[k] * 100).toFixed(1)}%`;
+            });
+
+            statusDiv.textContent =
+                `Server: ${lastServerMs.toFixed(0)}ms | Round-trip: ${lastRoundTripMs.toFixed(0)}ms | ` +
+                `Smoothing: ${smoothBuffer.length} frames (${SMOOTHING_WINDOW_MS}ms) | Arch: ${result.arch}`;
+        }
+
+        toggleBtn.disabled = false;
+        toggleBtn.textContent = 'Start Camera';
+    </script>
+</body>
+</html>
